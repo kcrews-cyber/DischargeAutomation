@@ -1,0 +1,821 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  automateddischargesv3.xaml
+  Process      : Patient Discharge from Services (PRVNT)
+  Trigger      : Monday.com RPA Request Board — new discharge request row
+  Architecture : REFramework — Init → GetTransactionData → ProcessTransaction → EndProcess
+  Exception    : BusinessRuleException (BR validation failures — skip, no retry)
+                 SystemException (PRVNT/network errors — retry up to MaxRetryNumber)
+
+  Business Rules enforced:
+    BR-001  Required fields: Patient UUID, Discharge Type, Discharge Reason
+    BR-002  Only unenroll service(s) explicitly listed in Discharge Type
+    BR-003  Discharge Reason must exactly match PRVNT dropdown value
+    BR-004  Discharge Type = All → Select All Services in dialog
+    BR-005  Specific services → only check those service checkboxes
+    BR-006  Blank Discharge Reason → halt for that record
+    BR-007  Patient UUID must resolve to a valid PRVNT chart
+    BR-008  Confirm Discharged status in Health tab before writing note
+    BR-009  Internal note type UnEnrollment added for every processed patient
+    BR-010  Monday.com task marked Complete only after full batch is processed
+
+  ── CONFIG ───────────────────────────────────────────────────────────────────
+  Find the "Set Config Values" InvokeCode in the Initialization state.
+  Replace every REPLACE_ME with your actual values.
+  In production: swap Assign activities for Get Orchestrator Asset activities.
+  ─────────────────────────────────────────────────────────────────────────────
+
+  ── SELECTORS ────────────────────────────────────────────────────────────────
+  All PRVNT UI selectors are marked TODO below.
+  Use UiPath Web Recorder (Ctrl+W) against https://nsight.prvnt.ai to generate
+  accurate selectors, then paste them into the matching activities.
+  ─────────────────────────────────────────────────────────────────────────────
+-->
+<Activity mc:Ignorable="sap sap2010 sads" x:Class="automateddischargesv3.automateddischargesv3"
+    xmlns="http://schemas.microsoft.com/netfx/2009/xaml/activities"
+    xmlns:core="clr-namespace:UiPath.Core;assembly=UiPath.Core"
+    xmlns:mc="http://schemas.openxmlformats.org/markup-compatibility/2006"
+    xmlns:mva="clr-namespace:Microsoft.VisualBasic.Activities;assembly=System.Activities"
+    xmlns:s="clr-namespace:System;assembly=mscorlib"
+    xmlns:sap="http://schemas.microsoft.com/netfx/2009/xaml/activities/presentation"
+    xmlns:sap2010="http://schemas.microsoft.com/netfx/2010/xaml/activities/presentation"
+    xmlns:sads="http://schemas.microsoft.com/netfx/2010/xaml/activities/debugger"
+    xmlns:scg="clr-namespace:System.Collections.Generic;assembly=mscorlib"
+    xmlns:sd="clr-namespace:System.Data;assembly=System.Data"
+    xmlns:ui="http://schemas.uipath.com/workflow/activities"
+    xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml">
+  <mva:VisualBasic.Settings>
+    <mva:VisualBasicSettings>
+      <mva:VisualBasicImportReference Assembly="mscorlib" Import="System" />
+      <mva:VisualBasicImportReference Assembly="mscorlib" Import="System.IO" />
+      <mva:VisualBasicImportReference Assembly="mscorlib" Import="System.Collections.Generic" />
+      <mva:VisualBasicImportReference Assembly="System.Data" Import="System.Data" />
+      <mva:VisualBasicImportReference Assembly="System.Net.Http" Import="System.Net.Http" />
+      <mva:VisualBasicImportReference Assembly="mscorlib" Import="System.Text" />
+      <mva:VisualBasicImportReference Assembly="System" Import="System.Text.RegularExpressions" />
+      <mva:VisualBasicImportReference Assembly="System.Text.Json" Import="System.Text.Json" />
+      <mva:VisualBasicImportReference Assembly="UiPath.Core" Import="UiPath.Core" />
+    </mva:VisualBasicSettings>
+  </mva:VisualBasic.Settings>
+
+  <Sequence DisplayName="Autodischargev2 — Patient Discharge from Services">
+    <StateMachine DisplayName="Autodischargev2 State Machine" sap2010:WorkflowViewState.IdRef="SM1">
+
+      <!-- ═══════════════════════════════════════════════════════════════════
+           SHARED STATE MACHINE VARIABLES
+           ═══════════════════════════════════════════════════════════════════ -->
+      <StateMachine.Variables>
+        <Variable x:TypeArguments="scg:Dictionary(x:String,x:String)" Name="Config" Default="[New Dictionary(Of String,String)()]" />
+        <Variable x:TypeArguments="sd:DataTable" Name="DischargeQueue" />
+        <Variable x:TypeArguments="sd:DataRow" Name="TransactionItem" />
+        <Variable x:TypeArguments="x:Int32" Name="TransactionNumber" Default="0" />
+        <Variable x:TypeArguments="x:Int32" Name="RetryNumber" Default="0" />
+        <Variable x:TypeArguments="x:Int32" Name="MaxRetryNumber" Default="3" />
+        <Variable x:TypeArguments="x:Int32" Name="SuccessCount" Default="0" />
+        <Variable x:TypeArguments="x:Int32" Name="FailedCount" Default="0" />
+        <Variable x:TypeArguments="x:Boolean" Name="InitSuccess" Default="False" />
+        <Variable x:TypeArguments="x:Boolean" Name="TransactionFound" Default="False" />
+        <!-- Holds ItemIds of successfully processed patients for BR-010 -->
+        <Variable x:TypeArguments="scg:List(x:String)" Name="ProcessedItemIds" Default="[New List(Of String)()]" />
+        <!-- Holds ItemIds of failed patients so they can be flagged on the board -->
+        <Variable x:TypeArguments="scg:List(x:String)" Name="FailedItemIds" Default="[New List(Of String)()]" />
+        <Variable x:TypeArguments="ui:Browser" Name="PRVNTBrowser" />
+      </StateMachine.Variables>
+
+      <StateMachine.InitialState>
+        <x:Reference>InitializationState</x:Reference>
+      </StateMachine.InitialState>
+
+      <StateMachine.States>
+
+        <!-- ═══════════════════════════════════════════════════════════════
+             STATE 1 — INITIALIZATION
+             • Set config values
+             • Log into PRVNT
+             • Pull pending discharge requests from Monday.com board
+             • Build DischargeQueue DataTable
+             ═══════════════════════════════════════════════════════════════ -->
+        <State x:Name="InitializationState" DisplayName="Initialization">
+          <State.Entry>
+            <Sequence DisplayName="Init Entry">
+              <TryCatch DisplayName="Try — Initialize">
+                <TryCatch.Try>
+                  <Sequence DisplayName="Load Config, Login, Get Queue">
+
+                    <!-- ── CONFIG SECTION ──────────────────────────────────────────
+                         Replace every REPLACE_ME before running.
+                         Column IDs: open your Monday.com board → Settings → Columns
+                         to find the exact column ID for each field.
+                    ──────────────────────────────────────────────────────────────── -->
+                    <ui:InvokeCode DisplayName="Set Config Values">
+                      <ui:InvokeCode.Arguments>
+                        <InOutArgument x:TypeArguments="scg:Dictionary(x:String,x:String)" x:Key="cfg">Config</InOutArgument>
+                      </ui:InvokeCode.Arguments>
+                      <ui:InvokeCode.Code>
+                        <x:String xml:space="preserve">
+' ── PRVNT ─────────────────────────────────────────────────────────────────
+cfg("PRVNT_BaseUrl")            = "https://nsight.prvnt.ai"
+cfg("PRVNT_Username")           = "REPLACE_ME"
+cfg("PRVNT_Password")           = "REPLACE_ME"
+
+' ── Monday.com ────────────────────────────────────────────────────────────
+cfg("MondayApiKey")             = "REPLACE_ME"
+cfg("MondayBoardId")            = "REPLACE_ME"
+cfg("MondayPatientUuidColId")   = "REPLACE_ME"   ' column ID for Patient UUID
+cfg("MondayDischargeTypeColId") = "REPLACE_ME"   ' column ID for Discharge Type
+cfg("MondayDischargeReasonColId") = "REPLACE_ME" ' column ID for Discharge Reason
+cfg("MondayStatusColId")        = "status"        ' column ID for Status
+cfg("MondayPendingLabel")       = "Pending"        ' status label that means "ready to process"
+cfg("MondayCompleteLabel")      = "Done"           ' status label to set on completion
+
+' ── Bot settings ──────────────────────────────────────────────────────────
+cfg("MaxRetryNumber")           = "3"
+                        </x:String>
+                      </ui:InvokeCode.Code>
+                    </ui:InvokeCode>
+                    <!-- ── END CONFIG SECTION ───────────────────────────────────── -->
+
+                    <Assign DisplayName="Apply MaxRetryNumber">
+                      <Assign.To><OutArgument x:TypeArguments="x:Int32">[MaxRetryNumber]</OutArgument></Assign.To>
+                      <Assign.Value><InArgument x:TypeArguments="x:Int32">[Integer.Parse(Config("MaxRetryNumber"))]</InArgument></Assign.Value>
+                    </Assign>
+
+                    <ui:LogMessage Level="Info" Message="&quot;[Init] Autodischargev2 starting. Logging into PRVNT...&quot;" />
+
+                    <!-- Log into PRVNT (Step c) -->
+                    <ui:OpenBrowser DisplayName="Open PRVNT in Chrome" BrowserType="Chrome"
+                        Url="[Config(&quot;PRVNT_BaseUrl&quot;)]" Browser="[PRVNTBrowser]">
+                      <ui:OpenBrowser.Body>
+                        <ActivityAction x:TypeArguments="ui:Browser">
+                          <ActivityAction.Argument>
+                            <DelegateInArgument x:TypeArguments="ui:Browser" Name="b" />
+                          </ActivityAction.Argument>
+                          <Sequence DisplayName="Login to PRVNT">
+                            <!-- TODO: Re-record selectors with Web Recorder against nsight.prvnt.ai -->
+                            <ui:TypeInto DisplayName="Type Username"
+                                Selector="&lt;html app='chrome.exe' title='*PRVNT*' /&gt;&lt;webctrl tag='INPUT' name='email' /&gt;"
+                                Text="[Config(&quot;PRVNT_Username&quot;)]" EmptyField="True" />
+                            <ui:TypeInto DisplayName="Type Password"
+                                Selector="&lt;html app='chrome.exe' title='*PRVNT*' /&gt;&lt;webctrl tag='INPUT' name='password' type='password' /&gt;"
+                                Text="[Config(&quot;PRVNT_Password&quot;)]" EmptyField="True" />
+                            <ui:Click DisplayName="Click Sign In"
+                                Selector="&lt;html app='chrome.exe' title='*PRVNT*' /&gt;&lt;webctrl tag='BUTTON' type='submit' /&gt;" />
+                            <ui:WaitWebAttribute DisplayName="Wait — Dashboard loaded"
+                                Selector="&lt;html app='chrome.exe' title='*Dashboard*' /&gt;"
+                                Attribute="title" Text="*Dashboard*" />
+                          </Sequence>
+                        </ActivityAction>
+                      </ui:OpenBrowser.Body>
+                    </ui:OpenBrowser>
+
+                    <ui:LogMessage Level="Info" Message="&quot;[Init] PRVNT login successful. Fetching Monday.com discharge queue...&quot;" />
+
+                    <!-- Pull pending discharge requests from Monday.com board -->
+                    <ui:InvokeCode DisplayName="GET Monday.com — Build DischargeQueue DataTable">
+                      <ui:InvokeCode.Arguments>
+                        <InArgument x:TypeArguments="x:String" x:Key="apiKey">[Config("MondayApiKey")]</InArgument>
+                        <InArgument x:TypeArguments="x:String" x:Key="boardId">[Config("MondayBoardId")]</InArgument>
+                        <InArgument x:TypeArguments="x:String" x:Key="uuidColId">[Config("MondayPatientUuidColId")]</InArgument>
+                        <InArgument x:TypeArguments="x:String" x:Key="typeColId">[Config("MondayDischargeTypeColId")]</InArgument>
+                        <InArgument x:TypeArguments="x:String" x:Key="reasonColId">[Config("MondayDischargeReasonColId")]</InArgument>
+                        <InArgument x:TypeArguments="x:String" x:Key="statusColId">[Config("MondayStatusColId")]</InArgument>
+                        <InArgument x:TypeArguments="x:String" x:Key="pendingLabel">[Config("MondayPendingLabel")]</InArgument>
+                        <OutArgument x:TypeArguments="sd:DataTable" x:Key="queue">DischargeQueue</OutArgument>
+                      </ui:InvokeCode.Arguments>
+                      <ui:InvokeCode.Code>
+                        <x:String xml:space="preserve">
+Dim dt As New System.Data.DataTable()
+dt.Columns.Add("ItemId")
+dt.Columns.Add("PatientUUID")
+dt.Columns.Add("DischargeType")
+dt.Columns.Add("DischargeReason")
+dt.Columns.Add("Status")
+
+Dim client As New System.Net.Http.HttpClient()
+client.DefaultRequestHeaders.Add("Authorization", apiKey)
+client.DefaultRequestHeaders.Add("API-Version", "2024-01")
+
+' Query all items and their column values
+Dim gql As String = "{""query"":""{boards(ids:[" &amp; boardId &amp; "]){items_page(limit:500){items{id column_values{id text}}}}}""}"
+Dim content As New System.Net.Http.StringContent(gql, System.Text.Encoding.UTF8, "application/json")
+Dim resp As System.Net.Http.HttpResponseMessage = client.PostAsync("https://api.monday.com/v2", content).Result
+Dim json As String = resp.Content.ReadAsStringAsync().Result
+client.Dispose()
+
+' Parse with System.Text.Json
+Dim doc As System.Text.Json.JsonDocument = System.Text.Json.JsonDocument.Parse(json)
+Dim items As System.Text.Json.JsonElement = doc.RootElement _
+    .GetProperty("data").GetProperty("boards")(0) _
+    .GetProperty("items_page").GetProperty("items")
+
+For Each item As System.Text.Json.JsonElement In items.EnumerateArray()
+    Dim itemId As String = item.GetProperty("id").GetString()
+    Dim uuid As String = ""
+    Dim dischargeType As String = ""
+    Dim dischargeReason As String = ""
+    Dim statusVal As String = ""
+
+    For Each col As System.Text.Json.JsonElement In item.GetProperty("column_values").EnumerateArray()
+        Dim colId As String = col.GetProperty("id").GetString()
+        Dim colText As String = If(col.TryGetProperty("text", Nothing), col.GetProperty("text").GetString(), "")
+        If colId = uuidColId Then uuid = colText
+        If colId = typeColId Then dischargeType = colText
+        If colId = reasonColId Then dischargeReason = colText
+        If colId = statusColId Then statusVal = colText
+    Next
+
+    ' Only queue rows with the pending status label (skip already processed / done rows)
+    If statusVal.Trim().ToLower() = pendingLabel.Trim().ToLower() Then
+        Dim row As System.Data.DataRow = dt.NewRow()
+        row("ItemId")         = itemId
+        row("PatientUUID")    = uuid.Trim()
+        row("DischargeType")  = dischargeType.Trim()
+        row("DischargeReason") = dischargeReason.Trim()
+        row("Status")         = statusVal.Trim()
+        dt.Rows.Add(row)
+    End If
+Next
+
+queue = dt
+                        </x:String>
+                      </ui:InvokeCode.Code>
+                    </ui:InvokeCode>
+
+                    <Assign DisplayName="Reset TransactionNumber">
+                      <Assign.To><OutArgument x:TypeArguments="x:Int32">[TransactionNumber]</OutArgument></Assign.To>
+                      <Assign.Value><InArgument x:TypeArguments="x:Int32">0</InArgument></Assign.Value>
+                    </Assign>
+
+                    <ui:LogMessage Level="Info"
+                        Message="[&quot;[Init] Queue loaded — &quot; &amp; DischargeQueue.Rows.Count.ToString() &amp; &quot; pending discharge request(s) found.&quot;]" />
+
+                    <Assign DisplayName="InitSuccess = True">
+                      <Assign.To><OutArgument x:TypeArguments="x:Boolean">[InitSuccess]</OutArgument></Assign.To>
+                      <Assign.Value><InArgument x:TypeArguments="x:Boolean">True</InArgument></Assign.Value>
+                    </Assign>
+                  </Sequence>
+                </TryCatch.Try>
+                <TryCatch.Catches>
+                  <Catch x:TypeArguments="x:Exception">
+                    <ActivityAction x:TypeArguments="x:Exception">
+                      <ActivityAction.Argument>
+                        <DelegateInArgument x:TypeArguments="x:Exception" Name="initEx" />
+                      </ActivityAction.Argument>
+                      <Sequence>
+                        <ui:LogMessage Level="Fatal"
+                            Message="[&quot;[Init] FATAL — bot cannot start: &quot; &amp; initEx.Message]" />
+                        <Assign DisplayName="InitSuccess = False">
+                          <Assign.To><OutArgument x:TypeArguments="x:Boolean">[InitSuccess]</OutArgument></Assign.To>
+                          <Assign.Value><InArgument x:TypeArguments="x:Boolean">False</InArgument></Assign.Value>
+                        </Assign>
+                      </Sequence>
+                    </ActivityAction>
+                  </Catch>
+                </TryCatch.Catches>
+              </TryCatch>
+            </Sequence>
+          </State.Entry>
+          <State.Transitions>
+            <Transition DisplayName="Init OK → GetTransactionData" To="GetTransactionDataState">
+              <Transition.Condition><InArgument x:TypeArguments="x:Boolean">[InitSuccess]</InArgument></Transition.Condition>
+            </Transition>
+            <Transition DisplayName="Init Failed → EndProcess" To="EndProcessState">
+              <Transition.Condition><InArgument x:TypeArguments="x:Boolean">[Not InitSuccess]</InArgument></Transition.Condition>
+            </Transition>
+          </State.Transitions>
+        </State>
+
+        <!-- ═══════════════════════════════════════════════════════════════
+             STATE 2 — GET TRANSACTION DATA
+             • Advance to next row in DischargeQueue
+             • Validate required fields (BR-001, BR-006, BR-007)
+             • Throw BusinessRuleException for any validation failure
+             ═══════════════════════════════════════════════════════════════ -->
+        <State x:Name="GetTransactionDataState" DisplayName="Get Transaction Data">
+          <State.Entry>
+            <Sequence DisplayName="GetTransactionData Entry">
+              <If DisplayName="Rows remaining?" Condition="[DischargeQueue IsNot Nothing AndAlso TransactionNumber &lt; DischargeQueue.Rows.Count]">
+                <If.Then>
+                  <Sequence DisplayName="Get next row and validate">
+                    <Assign DisplayName="Set TransactionItem">
+                      <Assign.To><OutArgument x:TypeArguments="sd:DataRow">[TransactionItem]</OutArgument></Assign.To>
+                      <Assign.Value><InArgument x:TypeArguments="sd:DataRow">[DischargeQueue.Rows(TransactionNumber)]</InArgument></Assign.Value>
+                    </Assign>
+                    <Assign DisplayName="TransactionFound = True">
+                      <Assign.To><OutArgument x:TypeArguments="x:Boolean">[TransactionFound]</OutArgument></Assign.To>
+                      <Assign.Value><InArgument x:TypeArguments="x:Boolean">True</InArgument></Assign.Value>
+                    </Assign>
+                    <ui:LogMessage Level="Info"
+                        Message="[&quot;[GetTransaction] Row &quot; &amp; (TransactionNumber + 1).ToString() &amp; &quot; of &quot; &amp; DischargeQueue.Rows.Count.ToString() &amp; &quot; — ItemId: &quot; &amp; TransactionItem(&quot;ItemId&quot;).ToString()]" />
+                  </Sequence>
+                </If.Then>
+                <If.Else>
+                  <Sequence DisplayName="Queue exhausted">
+                    <Assign DisplayName="TransactionFound = False">
+                      <Assign.To><OutArgument x:TypeArguments="x:Boolean">[TransactionFound]</OutArgument></Assign.To>
+                      <Assign.Value><InArgument x:TypeArguments="x:Boolean">False</InArgument></Assign.Value>
+                    </Assign>
+                    <ui:LogMessage Level="Info" Message="&quot;[GetTransaction] All records processed. Moving to End Process.&quot;" />
+                  </Sequence>
+                </If.Else>
+              </If>
+            </Sequence>
+          </State.Entry>
+          <State.Transitions>
+            <Transition DisplayName="Item found → ProcessTransaction" To="ProcessTransactionState">
+              <Transition.Condition><InArgument x:TypeArguments="x:Boolean">[TransactionFound]</InArgument></Transition.Condition>
+            </Transition>
+            <Transition DisplayName="Queue empty → EndProcess" To="EndProcessState">
+              <Transition.Condition><InArgument x:TypeArguments="x:Boolean">[Not TransactionFound]</InArgument></Transition.Condition>
+            </Transition>
+          </State.Transitions>
+        </State>
+
+        <!-- ═══════════════════════════════════════════════════════════════
+             STATE 3 — PROCESS TRANSACTION
+             Full PRVNT discharge workflow for one patient (Steps d–r)
+             ═══════════════════════════════════════════════════════════════ -->
+        <State x:Name="ProcessTransactionState" DisplayName="Process Transaction">
+          <State.Entry>
+            <Sequence DisplayName="ProcessTransaction Entry">
+              <Sequence.Variables>
+                <Variable x:TypeArguments="x:String" Name="ItemId" Default="&quot;&quot;" />
+                <Variable x:TypeArguments="x:String" Name="PatientUUID" Default="&quot;&quot;" />
+                <Variable x:TypeArguments="x:String" Name="DischargeType" Default="&quot;&quot;" />
+                <Variable x:TypeArguments="x:String" Name="DischargeReason" Default="&quot;&quot;" />
+                <Variable x:TypeArguments="x:String" Name="PatientUrl" Default="&quot;&quot;" />
+                <Variable x:TypeArguments="x:String" Name="NoteServicesStr" Default="&quot;&quot;" />
+                <Variable x:TypeArguments="x:String" Name="NoteText" Default="&quot;&quot;" />
+                <Variable x:TypeArguments="x:String" Name="VerifiedStatus" Default="&quot;&quot;" />
+                <Variable x:TypeArguments="x:String" Name="DischargeTypeNorm" Default="&quot;&quot;" />
+              </Sequence.Variables>
+
+              <!-- Unpack DataRow -->
+              <Assign DisplayName="Set ItemId"><Assign.To><OutArgument x:TypeArguments="x:String">[ItemId]</OutArgument></Assign.To><Assign.Value><InArgument x:TypeArguments="x:String">[TransactionItem("ItemId").ToString().Trim()]</InArgument></Assign.Value></Assign>
+              <Assign DisplayName="Set PatientUUID"><Assign.To><OutArgument x:TypeArguments="x:String">[PatientUUID]</OutArgument></Assign.To><Assign.Value><InArgument x:TypeArguments="x:String">[TransactionItem("PatientUUID").ToString().Trim()]</InArgument></Assign.Value></Assign>
+              <Assign DisplayName="Set DischargeType"><Assign.To><OutArgument x:TypeArguments="x:String">[DischargeType]</OutArgument></Assign.To><Assign.Value><InArgument x:TypeArguments="x:String">[TransactionItem("DischargeType").ToString().Trim()]</InArgument></Assign.Value></Assign>
+              <Assign DisplayName="Set DischargeReason"><Assign.To><OutArgument x:TypeArguments="x:String">[DischargeReason]</OutArgument></Assign.To><Assign.Value><InArgument x:TypeArguments="x:String">[TransactionItem("DischargeReason").ToString().Trim()]</InArgument></Assign.Value></Assign>
+              <Assign DisplayName="Normalize DischargeType (uppercase for comparisons)"><Assign.To><OutArgument x:TypeArguments="x:String">[DischargeTypeNorm]</OutArgument></Assign.To><Assign.Value><InArgument x:TypeArguments="x:String">[DischargeType.ToUpper().Trim()]</InArgument></Assign.Value></Assign>
+
+              <ui:LogMessage Level="Info"
+                  Message="[&quot;[Process] Starting — ItemId: &quot; &amp; ItemId &amp; &quot; | UUID: &quot; &amp; PatientUUID &amp; &quot; | Type: &quot; &amp; DischargeType &amp; &quot; | Reason: &quot; &amp; DischargeReason &amp; &quot; | Retry: &quot; &amp; RetryNumber.ToString()]" />
+
+              <!-- ══ OUTER TRY/CATCH: BR exceptions skip; System exceptions retry ══ -->
+              <TryCatch DisplayName="REF Exception Handling">
+                <TryCatch.Try>
+                  <Sequence DisplayName="Steps d–r: Full PRVNT Discharge Workflow">
+
+                    <!-- ── BR-001: Required field validation ──────────────────── -->
+                    <If DisplayName="BR-001: Patient UUID present?" Condition="[String.IsNullOrWhiteSpace(PatientUUID)]">
+                      <If.Then>
+                        <Throw DisplayName="BR-001 — Missing Patient UUID">
+                          <Throw.Exception>
+                            <InArgument x:TypeArguments="x:Exception">[New UiPath.Core.BusinessRuleException("BR-001: Patient UUID is missing or blank. Cannot navigate to patient chart. ItemId: " &amp; ItemId)]</InArgument>
+                          </Throw.Exception>
+                        </Throw>
+                      </If.Then>
+                    </If>
+
+                    <If DisplayName="BR-001: Discharge Type present?" Condition="[String.IsNullOrWhiteSpace(DischargeType)]">
+                      <If.Then>
+                        <Throw DisplayName="BR-001 — Missing Discharge Type">
+                          <Throw.Exception>
+                            <InArgument x:TypeArguments="x:Exception">[New UiPath.Core.BusinessRuleException("BR-001: Discharge Type is missing or blank. ItemId: " &amp; ItemId)]</InArgument>
+                          </Throw.Exception>
+                        </Throw>
+                      </If.Then>
+                    </If>
+
+                    <!-- BR-006: Discharge Reason must not be blank -->
+                    <If DisplayName="BR-006: Discharge Reason present?" Condition="[String.IsNullOrWhiteSpace(DischargeReason)]">
+                      <If.Then>
+                        <Throw DisplayName="BR-006 — Missing Discharge Reason">
+                          <Throw.Exception>
+                            <InArgument x:TypeArguments="x:Exception">[New UiPath.Core.BusinessRuleException("BR-006: Discharge Reason is blank. Bot must not proceed. ItemId: " &amp; ItemId)]</InArgument>
+                          </Throw.Exception>
+                        </Throw>
+                      </If.Then>
+                    </If>
+
+                    <!-- BR-002/BR-004/BR-005: Validate DischargeType is a known value -->
+                    <If DisplayName="BR-002: Discharge Type is a known value?" Condition="[DischargeTypeNorm &lt;&gt; &quot;ALL&quot; AndAlso Not DischargeTypeNorm.Contains(&quot;RPM&quot;)]">
+                      <If.Then>
+                        <Throw DisplayName="BR-002 — Unknown Discharge Type">
+                          <Throw.Exception>
+                            <InArgument x:TypeArguments="x:Exception">[New UiPath.Core.BusinessRuleException("BR-002: Discharge Type '" &amp; DischargeType &amp; "' is not a recognised value (RPM | RPM and CCM | RPM, CCM, and BHI | All). ItemId: " &amp; ItemId)]</InArgument>
+                          </Throw.Exception>
+                        </Throw>
+                      </If.Then>
+                    </If>
+
+                    <!-- Build NoteServicesStr and NoteText for BR-009 -->
+                    <ui:InvokeCode DisplayName="Build internal note text (BR-009)">
+                      <ui:InvokeCode.Arguments>
+                        <InArgument x:TypeArguments="x:String" x:Key="dischargeType">[DischargeType]</InArgument>
+                        <InArgument x:TypeArguments="x:String" x:Key="dischargeTypeNorm">[DischargeTypeNorm]</InArgument>
+                        <InArgument x:TypeArguments="x:String" x:Key="dischargeReason">[DischargeReason]</InArgument>
+                        <OutArgument x:TypeArguments="x:String" x:Key="servicesStr">NoteServicesStr</OutArgument>
+                        <OutArgument x:TypeArguments="x:String" x:Key="noteText">NoteText</OutArgument>
+                      </ui:InvokeCode.Arguments>
+                      <ui:InvokeCode.Code>
+                        <x:String xml:space="preserve">
+If dischargeTypeNorm = "ALL" Then
+    servicesStr = "All Services"
+Else
+    servicesStr = dischargeType  ' e.g. "RPM", "RPM and CCM", "RPM, CCM, and BHI"
+End If
+' Standard note template per requirements section 3q
+noteText = "This patient has been discharged from " &amp; servicesStr &amp; " services due to " &amp; dischargeReason &amp; "."
+                        </x:String>
+                      </ui:InvokeCode.Code>
+                    </ui:InvokeCode>
+
+                    <!-- Build patient chart URL -->
+                    <Assign DisplayName="Step e — Build patient chart URL">
+                      <Assign.To><OutArgument x:TypeArguments="x:String">[PatientUrl]</OutArgument></Assign.To>
+                      <Assign.Value><InArgument x:TypeArguments="x:String">[Config("PRVNT_BaseUrl") &amp; "/patients/" &amp; PatientUUID &amp; "/overview"]</InArgument></Assign.Value>
+                    </Assign>
+
+                    <!-- Step e/f: Navigate to patient chart and confirm (BR-007) -->
+                    <ui:NavigateTo DisplayName="Step e — Navigate to patient chart (UUID in URL)" Browser="[PRVNTBrowser]" Url="[PatientUrl]" />
+
+                    <!-- BR-007: Confirm we landed on a valid patient chart, not a 404/error page -->
+                    <ui:InvokeCode DisplayName="Step f — BR-007: Confirm valid patient chart">
+                      <ui:InvokeCode.Arguments>
+                        <InArgument x:TypeArguments="x:String" x:Key="uuid">[PatientUUID]</InArgument>
+                        <InArgument x:TypeArguments="x:String" x:Key="patientUrl">[PatientUrl]</InArgument>
+                      </ui:InvokeCode.Arguments>
+                      <ui:InvokeCode.Code>
+                        <x:String xml:space="preserve">
+' The WaitWebAttribute below will time out if the chart does not load,
+' which the outer SystemException catch will handle as a retry-able error.
+' A 404 / "patient not found" page needs its own check — implement by
+' inspecting the page title or a specific error element selector.
+' For now we rely on WaitWebAttribute timing out as the error signal.
+                        </x:String>
+                      </ui:InvokeCode.Code>
+                    </ui:InvokeCode>
+
+                    <!-- Wait for patient chart to load — times out = BR-007 system error -->
+                    <ui:WaitWebAttribute DisplayName="Step f — Wait for patient chart to load"
+                        Selector="&lt;html app='chrome.exe' title='*Patient*' /&gt;"
+                        Attribute="title" Text="*Patient*" />
+
+                    <!-- Step g: Click Health tab -->
+                    <ui:Click DisplayName="Step g — Click Health tab"
+                        Selector="&lt;html app='chrome.exe' /&gt;&lt;webctrl tag='A' aaname='Health' /&gt;" />
+                    <ui:WaitWebAttribute DisplayName="Wait — Health tab loaded"
+                        Selector="&lt;html app='chrome.exe' /&gt;&lt;webctrl tag='DIV' id='health-tab-content' /&gt;"
+                        Attribute="class" Text="*active*" />
+
+                    <!-- Step h: Click Actions button -->
+                    <ui:Click DisplayName="Step h — Click Actions"
+                        Selector="&lt;html app='chrome.exe' /&gt;&lt;webctrl tag='BUTTON' aaname='Actions' /&gt;" />
+                    <ui:WaitWebAttribute DisplayName="Wait — Actions menu open"
+                        Selector="&lt;html app='chrome.exe' /&gt;&lt;webctrl tag='UL' class='*dropdown-menu*' /&gt;"
+                        Attribute="class" Text="*show*" />
+
+                    <!-- Step i: Select Request an Enrollment from Actions menu -->
+                    <ui:Click DisplayName="Step i — Click Request an Enrollment"
+                        Selector="&lt;html app='chrome.exe' /&gt;&lt;webctrl tag='A' aaname='Request an Enrollment' /&gt;" />
+                    <ui:WaitWebAttribute DisplayName="Wait — Enrollment dialog open"
+                        Selector="&lt;html app='chrome.exe' /&gt;&lt;webctrl tag='DIV' class='*enrollment-dialog*' /&gt;"
+                        Attribute="class" Text="*show*" />
+
+                    <!-- Step j: Select service(s) based on Discharge Type (BR-002, BR-004, BR-005) -->
+                    <If DisplayName="Step j — Discharge Type = All? (BR-004)" Condition="[DischargeTypeNorm = &quot;ALL&quot;]">
+                      <If.Then>
+                        <!-- BR-004: Select All Services -->
+                        <ui:Click DisplayName="BR-004 — Click Select All Services"
+                            Selector="&lt;html app='chrome.exe' /&gt;&lt;webctrl tag='INPUT' id='selectAllServices' type='checkbox' /&gt;" />
+                      </If.Then>
+                      <If.Else>
+                        <!-- BR-005: Select only the specified services -->
+                        <Sequence DisplayName="BR-005 — Select individual service(s)">
+                          <!-- RPM checkbox — selected if DischargeType contains "RPM" -->
+                          <If DisplayName="Select RPM?" Condition="[DischargeTypeNorm.Contains(&quot;RPM&quot;)]">
+                            <If.Then>
+                              <ui:Click DisplayName="Check RPM"
+                                  Selector="&lt;html app='chrome.exe' /&gt;&lt;webctrl tag='INPUT' id='service-rpm' type='checkbox' /&gt;" />
+                            </If.Then>
+                          </If>
+                          <!-- CCM checkbox -->
+                          <If DisplayName="Select CCM?" Condition="[DischargeTypeNorm.Contains(&quot;CCM&quot;)]">
+                            <If.Then>
+                              <ui:Click DisplayName="Check CCM"
+                                  Selector="&lt;html app='chrome.exe' /&gt;&lt;webctrl tag='INPUT' id='service-ccm' type='checkbox' /&gt;" />
+                            </If.Then>
+                          </If>
+                          <!-- BHI checkbox -->
+                          <If DisplayName="Select BHI?" Condition="[DischargeTypeNorm.Contains(&quot;BHI&quot;)]">
+                            <If.Then>
+                              <ui:Click DisplayName="Check BHI"
+                                  Selector="&lt;html app='chrome.exe' /&gt;&lt;webctrl tag='INPUT' id='service-bhi' type='checkbox' /&gt;" />
+                            </If.Then>
+                          </If>
+                        </Sequence>
+                      </If.Else>
+                    </If>
+
+                    <!-- Step k: Select Discharge Reason (BR-003 — exact match required) -->
+                    <ui:SelectItem DisplayName="Step k — Select Discharge Reason (BR-003 exact match)"
+                        Selector="&lt;html app='chrome.exe' /&gt;&lt;webctrl tag='SELECT' id='reasonForEnrollment' /&gt;"
+                        Item="[DischargeReason]" />
+
+                    <!-- Step l: Click Proceed / Submit -->
+                    <ui:Click DisplayName="Step l — Click Proceed / Submit"
+                        Selector="&lt;html app='chrome.exe' /&gt;&lt;webctrl tag='BUTTON' aaname='Proceed' /&gt;" />
+                    <ui:WaitWebAttribute DisplayName="Wait — dialog closes after submit"
+                        Selector="&lt;html app='chrome.exe' /&gt;&lt;webctrl tag='DIV' class='*enrollment-dialog*' /&gt;"
+                        Attribute="class" Text="*hide*" />
+
+                    <!-- Step m: Navigate to Overview tab and confirm unenrollment notification -->
+                    <ui:Click DisplayName="Step m — Click Overview tab"
+                        Selector="&lt;html app='chrome.exe' /&gt;&lt;webctrl tag='A' aaname='Overview' /&gt;" />
+                    <ui:WaitWebAttribute DisplayName="Step m — Wait for unenrollment notification"
+                        Selector="&lt;html app='chrome.exe' /&gt;&lt;webctrl tag='DIV' class='*notification*' /&gt;"
+                        Attribute="innertext" Text="*Unenrollment requested*" />
+
+                    <!-- Step n: Click Approve -->
+                    <ui:Click DisplayName="Step n — Click Approve"
+                        Selector="&lt;html app='chrome.exe' /&gt;&lt;webctrl tag='BUTTON' aaname='Approve' /&gt;" />
+                    <ui:WaitWebAttribute DisplayName="Wait — second confirmation notification"
+                        Selector="&lt;html app='chrome.exe' /&gt;&lt;webctrl tag='DIV' class='*notification*' /&gt;"
+                        Attribute="innertext" Text="*Mark Enrollment Complete*" />
+
+                    <!-- Step o: Click Mark Enrollment Complete -->
+                    <ui:Click DisplayName="Step o — Click Mark Enrollment Complete"
+                        Selector="&lt;html app='chrome.exe' /&gt;&lt;webctrl tag='BUTTON' aaname='Mark Enrollment Complete' /&gt;" />
+                    <ui:WaitWebAttribute DisplayName="Wait — enrollment completion confirmed"
+                        Selector="&lt;html app='chrome.exe' /&gt;&lt;webctrl tag='DIV' class='*notification*' /&gt;"
+                        Attribute="class" Text="*success*" />
+
+                    <!-- Step p: Navigate to Health tab and verify Discharged status (BR-008) -->
+                    <ui:Click DisplayName="Step p — Navigate to Health tab for verification"
+                        Selector="&lt;html app='chrome.exe' /&gt;&lt;webctrl tag='A' aaname='Health' /&gt;" />
+                    <ui:WaitWebAttribute DisplayName="Wait — Health tab reloaded"
+                        Selector="&lt;html app='chrome.exe' /&gt;&lt;webctrl tag='DIV' id='health-tab-content' /&gt;"
+                        Attribute="class" Text="*active*" />
+
+                    <!-- BR-008: Read and verify Discharged status for each relevant service -->
+                    <ui:GetText DisplayName="BR-008 — Read service status from Health tab"
+                        Selector="&lt;html app='chrome.exe' /&gt;&lt;webctrl tag='DIV' class='*enrollment-status*' /&gt;"
+                        Value="[VerifiedStatus]" />
+
+                    <If DisplayName="BR-008: Confirm status = Discharged" Condition="[Not VerifiedStatus.ToLower().Contains(&quot;discharged&quot;)]">
+                      <If.Then>
+                        <Throw DisplayName="BR-008 — Discharged status not confirmed">
+                          <Throw.Exception>
+                            <InArgument x:TypeArguments="x:Exception">[New Exception("BR-008: Health tab does not show Discharged status after processing. Actual value: '" &amp; VerifiedStatus &amp; "'. ItemId: " &amp; ItemId)]</InArgument>
+                          </Throw.Exception>
+                        </Throw>
+                      </If.Then>
+                    </If>
+
+                    <ui:LogMessage Level="Info"
+                        Message="[&quot;[Process] BR-008 confirmed — &quot; &amp; DischargeType &amp; &quot; status is Discharged for UUID &quot; &amp; PatientUUID]" />
+
+                    <!-- Step q/r: Add Internal Note (BR-009) -->
+                    <!-- Navigate to Internal Notes section -->
+                    <ui:Click DisplayName="Step q — Navigate to Internal Notes section"
+                        Selector="&lt;html app='chrome.exe' /&gt;&lt;webctrl tag='A' aaname='Internal Notes' /&gt;" />
+                    <ui:WaitWebAttribute DisplayName="Wait — Internal Notes section loaded"
+                        Selector="&lt;html app='chrome.exe' /&gt;&lt;webctrl tag='DIV' id='internal-notes' /&gt;"
+                        Attribute="class" Text="*loaded*" />
+
+                    <!-- Set Note Type = UnEnrollment (BR-009) -->
+                    <ui:SelectItem DisplayName="Step q — Set Note Type = UnEnrollment (BR-009)"
+                        Selector="&lt;html app='chrome.exe' /&gt;&lt;webctrl tag='SELECT' id='noteType' /&gt;"
+                        Item="UnEnrollment" />
+
+                    <!-- Enter standard note text -->
+                    <ui:TypeInto DisplayName="Step q — Enter internal note text"
+                        Selector="&lt;html app='chrome.exe' /&gt;&lt;webctrl tag='TEXTAREA' id='noteContent' /&gt;"
+                        Text="[NoteText]" EmptyField="True" />
+
+                    <!-- Step r: Click Add Internal Note -->
+                    <ui:Click DisplayName="Step r — Click Add Internal Note"
+                        Selector="&lt;html app='chrome.exe' /&gt;&lt;webctrl tag='BUTTON' aaname='Add Internal Note' /&gt;" />
+                    <ui:WaitWebAttribute DisplayName="Wait — note saved confirmation"
+                        Selector="&lt;html app='chrome.exe' /&gt;&lt;webctrl tag='DIV' class='*note-saved*' /&gt;"
+                        Attribute="class" Text="*success*" />
+
+                    <ui:LogMessage Level="Info"
+                        Message="[&quot;[Process] BR-009 confirmed — Internal note added: &quot; &amp; NoteText]" />
+
+                    <!-- ── SUCCESS PATH ── -->
+                    <ui:LogMessage Level="Info"
+                        Message="[&quot;[Process] SUCCESS — UUID: &quot; &amp; PatientUUID &amp; &quot; | &quot; &amp; DischargeType &amp; &quot; discharged for reason: &quot; &amp; DischargeReason]" />
+
+                    <!-- Track this ItemId for bulk Monday.com completion (BR-010) -->
+                    <ui:InvokeCode DisplayName="Add ItemId to ProcessedItemIds">
+                      <ui:InvokeCode.Arguments>
+                        <InArgument x:TypeArguments="x:String" x:Key="itemId">[ItemId]</InArgument>
+                        <InOutArgument x:TypeArguments="scg:List(x:String)" x:Key="processedIds">ProcessedItemIds</InOutArgument>
+                      </ui:InvokeCode.Arguments>
+                      <ui:InvokeCode.Code>
+                        <x:String xml:space="preserve">processedIds.Add(itemId)</x:String>
+                      </ui:InvokeCode.Code>
+                    </ui:InvokeCode>
+
+                    <Assign DisplayName="Increment SuccessCount">
+                      <Assign.To><OutArgument x:TypeArguments="x:Int32">[SuccessCount]</OutArgument></Assign.To>
+                      <Assign.Value><InArgument x:TypeArguments="x:Int32">[SuccessCount + 1]</InArgument></Assign.Value>
+                    </Assign>
+                    <Assign DisplayName="Advance to next row">
+                      <Assign.To><OutArgument x:TypeArguments="x:Int32">[TransactionNumber]</OutArgument></Assign.To>
+                      <Assign.Value><InArgument x:TypeArguments="x:Int32">[TransactionNumber + 1]</InArgument></Assign.Value>
+                    </Assign>
+                    <Assign DisplayName="Reset RetryNumber">
+                      <Assign.To><OutArgument x:TypeArguments="x:Int32">[RetryNumber]</OutArgument></Assign.To>
+                      <Assign.Value><InArgument x:TypeArguments="x:Int32">0</InArgument></Assign.Value>
+                    </Assign>
+
+                  </Sequence>
+                </TryCatch.Try>
+
+                <!-- ── BR exception: skip record, no retry ── -->
+                <TryCatch.Catches>
+                  <Catch x:TypeArguments="core:BusinessRuleException">
+                    <ActivityAction x:TypeArguments="core:BusinessRuleException">
+                      <ActivityAction.Argument>
+                        <DelegateInArgument x:TypeArguments="core:BusinessRuleException" Name="bex" />
+                      </ActivityAction.Argument>
+                      <Sequence DisplayName="Handle BR Exception — skip, no retry">
+                        <ui:LogMessage Level="Warn"
+                            Message="[&quot;[Process] BusinessRuleException — skipping ItemId &quot; &amp; ItemId &amp; &quot;: &quot; &amp; bex.Message]" />
+                        <ui:InvokeCode DisplayName="Track failed ItemId">
+                          <ui:InvokeCode.Arguments>
+                            <InArgument x:TypeArguments="x:String" x:Key="itemId">[ItemId]</InArgument>
+                            <InOutArgument x:TypeArguments="scg:List(x:String)" x:Key="failedIds">FailedItemIds</InOutArgument>
+                          </ui:InvokeCode.Arguments>
+                          <ui:InvokeCode.Code>
+                            <x:String xml:space="preserve">failedIds.Add(itemId)</x:String>
+                          </ui:InvokeCode.Code>
+                        </ui:InvokeCode>
+                        <Assign DisplayName="Increment FailedCount">
+                          <Assign.To><OutArgument x:TypeArguments="x:Int32">[FailedCount]</OutArgument></Assign.To>
+                          <Assign.Value><InArgument x:TypeArguments="x:Int32">[FailedCount + 1]</InArgument></Assign.Value>
+                        </Assign>
+                        <Assign DisplayName="Advance to next row">
+                          <Assign.To><OutArgument x:TypeArguments="x:Int32">[TransactionNumber]</OutArgument></Assign.To>
+                          <Assign.Value><InArgument x:TypeArguments="x:Int32">[TransactionNumber + 1]</InArgument></Assign.Value>
+                        </Assign>
+                        <Assign DisplayName="Reset RetryNumber">
+                          <Assign.To><OutArgument x:TypeArguments="x:Int32">[RetryNumber]</OutArgument></Assign.To>
+                          <Assign.Value><InArgument x:TypeArguments="x:Int32">0</InArgument></Assign.Value>
+                        </Assign>
+                      </Sequence>
+                    </ActivityAction>
+                  </Catch>
+
+                  <!-- ── System exception: retry up to MaxRetryNumber ── -->
+                  <Catch x:TypeArguments="x:Exception">
+                    <ActivityAction x:TypeArguments="x:Exception">
+                      <ActivityAction.Argument>
+                        <DelegateInArgument x:TypeArguments="x:Exception" Name="sex" />
+                      </ActivityAction.Argument>
+                      <Sequence DisplayName="Handle System Exception — retry or skip">
+                        <ui:LogMessage Level="Error"
+                            Message="[&quot;[Process] SystemException for ItemId &quot; &amp; ItemId &amp; &quot; (retry &quot; &amp; RetryNumber.ToString() &amp; &quot;/&quot; &amp; MaxRetryNumber.ToString() &amp; &quot;): &quot; &amp; sex.Message]" />
+                        <If DisplayName="Retries remaining?" Condition="[RetryNumber &lt; MaxRetryNumber]">
+                          <If.Then>
+                            <Sequence DisplayName="Increment retry counter">
+                              <Assign DisplayName="Increment RetryNumber">
+                                <Assign.To><OutArgument x:TypeArguments="x:Int32">[RetryNumber]</OutArgument></Assign.To>
+                                <Assign.Value><InArgument x:TypeArguments="x:Int32">[RetryNumber + 1]</InArgument></Assign.Value>
+                              </Assign>
+                              <ui:LogMessage Level="Warn"
+                                  Message="[&quot;[Process] Queuing retry &quot; &amp; RetryNumber.ToString() &amp; &quot; for ItemId &quot; &amp; ItemId]" />
+                              <!-- TransactionNumber NOT advanced — same row reprocessed next cycle -->
+                            </Sequence>
+                          </If.Then>
+                          <If.Else>
+                            <Sequence DisplayName="Max retries exceeded — give up on this record">
+                              <ui:LogMessage Level="Error"
+                                  Message="[&quot;[Process] Max retries exceeded for ItemId &quot; &amp; ItemId &amp; &quot;. Skipping.&quot;]" />
+                              <ui:InvokeCode DisplayName="Track failed ItemId">
+                                <ui:InvokeCode.Arguments>
+                                  <InArgument x:TypeArguments="x:String" x:Key="itemId">[ItemId]</InArgument>
+                                  <InOutArgument x:TypeArguments="scg:List(x:String)" x:Key="failedIds">FailedItemIds</InOutArgument>
+                                </ui:InvokeCode.Arguments>
+                                <ui:InvokeCode.Code>
+                                  <x:String xml:space="preserve">failedIds.Add(itemId)</x:String>
+                                </ui:InvokeCode.Code>
+                              </ui:InvokeCode>
+                              <Assign DisplayName="Increment FailedCount">
+                                <Assign.To><OutArgument x:TypeArguments="x:Int32">[FailedCount]</OutArgument></Assign.To>
+                                <Assign.Value><InArgument x:TypeArguments="x:Int32">[FailedCount + 1]</InArgument></Assign.Value>
+                              </Assign>
+                              <Assign DisplayName="Advance to next row">
+                                <Assign.To><OutArgument x:TypeArguments="x:Int32">[TransactionNumber]</OutArgument></Assign.To>
+                                <Assign.Value><InArgument x:TypeArguments="x:Int32">[TransactionNumber + 1]</InArgument></Assign.Value>
+                              </Assign>
+                              <Assign DisplayName="Reset RetryNumber">
+                                <Assign.To><OutArgument x:TypeArguments="x:Int32">[RetryNumber]</OutArgument></Assign.To>
+                                <Assign.Value><InArgument x:TypeArguments="x:Int32">0</InArgument></Assign.Value>
+                              </Assign>
+                            </Sequence>
+                          </If.Else>
+                        </If>
+                      </Sequence>
+                    </ActivityAction>
+                  </Catch>
+                </TryCatch.Catches>
+              </TryCatch>
+            </Sequence>
+          </State.Entry>
+          <State.Transitions>
+            <Transition DisplayName="→ GetTransactionData" To="GetTransactionDataState" />
+          </State.Transitions>
+        </State>
+
+        <!-- ═══════════════════════════════════════════════════════════════
+             STATE 4 — END PROCESS
+             • BR-010: Mark all successfully processed items as Complete on Monday.com
+             • Log final summary
+             • Close browser
+             ═══════════════════════════════════════════════════════════════ -->
+        <State x:Name="EndProcessState" DisplayName="End Process">
+          <State.Entry>
+            <Sequence DisplayName="EndProcess Entry">
+
+              <!-- BR-010: Mark processed items Complete on Monday.com board
+                   Only runs AFTER the full batch is finished, per the business rule. -->
+              <If DisplayName="BR-010: Processed items to mark Complete?" Condition="[ProcessedItemIds IsNot Nothing AndAlso ProcessedItemIds.Count &gt; 0]">
+                <If.Then>
+                  <TryCatch DisplayName="Try — Mark Monday.com items Complete (BR-010)">
+                    <TryCatch.Try>
+                      <ui:InvokeCode DisplayName="Bulk update Monday.com status → Complete">
+                        <ui:InvokeCode.Arguments>
+                          <InArgument x:TypeArguments="x:String" x:Key="apiKey">[Config("MondayApiKey")]</InArgument>
+                          <InArgument x:TypeArguments="x:String" x:Key="boardId">[Config("MondayBoardId")]</InArgument>
+                          <InArgument x:TypeArguments="x:String" x:Key="statusColId">[Config("MondayStatusColId")]</InArgument>
+                          <InArgument x:TypeArguments="x:String" x:Key="completeLabel">[Config("MondayCompleteLabel")]</InArgument>
+                          <InArgument x:TypeArguments="scg:List(x:String)" x:Key="processedIds">[ProcessedItemIds]</InArgument>
+                        </ui:InvokeCode.Arguments>
+                        <ui:InvokeCode.Code>
+                          <x:String xml:space="preserve">
+Dim client As New System.Net.Http.HttpClient()
+client.DefaultRequestHeaders.Add("Authorization", apiKey)
+client.DefaultRequestHeaders.Add("API-Version", "2024-01")
+
+For Each itemId As String In processedIds
+    Dim colValue As String = "{""label"":""" &amp; completeLabel &amp; """}"
+    Dim mutation As String = "{""query"":""mutation{change_column_value(board_id:" &amp; boardId &amp; ",item_id:" &amp; itemId &amp; ",column_id:\""" &amp; statusColId &amp; "\"",value:\""" &amp; colValue.Replace("""", "\""") &amp; "\""){id}}""}"
+    Dim content As New System.Net.Http.StringContent(mutation, System.Text.Encoding.UTF8, "application/json")
+    client.PostAsync("https://api.monday.com/v2", content).Wait()
+Next
+
+client.Dispose()
+                          </x:String>
+                        </ui:InvokeCode.Code>
+                      </ui:InvokeCode>
+                      <ui:LogMessage Level="Info"
+                          Message="[&quot;[End] BR-010 complete — &quot; &amp; ProcessedItemIds.Count.ToString() &amp; &quot; Monday.com item(s) marked Complete.&quot;]" />
+                    </TryCatch.Try>
+                    <TryCatch.Catches>
+                      <Catch x:TypeArguments="x:Exception">
+                        <ActivityAction x:TypeArguments="x:Exception">
+                          <ActivityAction.Argument>
+                            <DelegateInArgument x:TypeArguments="x:Exception" Name="mondayEx" />
+                          </ActivityAction.Argument>
+                          <ui:LogMessage Level="Error"
+                              Message="[&quot;[End] Monday.com completion update FAILED: &quot; &amp; mondayEx.Message &amp; &quot; — manual update required for ItemIds: &quot; &amp; String.Join(&quot;, &quot;, ProcessedItemIds)]" />
+                        </ActivityAction>
+                      </Catch>
+                    </TryCatch.Catches>
+                  </TryCatch>
+                </If.Then>
+              </If>
+
+              <!-- Close PRVNT browser -->
+              <TryCatch DisplayName="Try — Close PRVNT Browser">
+                <TryCatch.Try>
+                  <ui:CloseBrowser DisplayName="Close PRVNT Browser" Browser="[PRVNTBrowser]" />
+                </TryCatch.Try>
+                <TryCatch.Catches>
+                  <Catch x:TypeArguments="x:Exception">
+                    <ActivityAction x:TypeArguments="x:Exception">
+                      <ActivityAction.Argument>
+                        <DelegateInArgument x:TypeArguments="x:Exception" Name="closeEx" />
+                      </ActivityAction.Argument>
+                      <ui:LogMessage Level="Warn" Message="[&quot;[End] Browser close warning (non-fatal): &quot; &amp; closeEx.Message]" />
+                    </ActivityAction>
+                  </Catch>
+                </TryCatch.Catches>
+              </TryCatch>
+
+              <!-- Final run summary -->
+              <ui:LogMessage Level="Info"
+                  Message="[&quot;[End] Autodischargev2 complete. &quot; &amp; SuccessCount.ToString() &amp; &quot; succeeded | &quot; &amp; FailedCount.ToString() &amp; &quot; failed/skipped | &quot; &amp; (SuccessCount + FailedCount).ToString() &amp; &quot; total processed.&quot; &amp; If(FailedItemIds.Count &gt; 0, &quot; Failed ItemIds: &quot; &amp; String.Join(&quot;, &quot;, FailedItemIds), &quot;&quot;)]" />
+
+            </Sequence>
+          </State.Entry>
+          <!-- Final state — no transitions -->
+        </State>
+
+      </StateMachine.States>
+    </StateMachine>
+  </Sequence>
+</Activity>
