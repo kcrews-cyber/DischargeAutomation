@@ -1,0 +1,21 @@
+{
+  "$schema": "https://json.schemastore.org/uipath-project.json",
+  "name": "automateddischargesv3",
+  "description": "Automated Patient Discharge and Offboarding — PRVNT to Tenovi, Slack, Gmail, monday.com",
+  "main": "automateddischargesv3.xaml",
+  "outputType": "Process",
+  "schemaVersion": "4.0",
+  "studioVersion": "23.10.0",
+  "projectVersion": "1.0.0",
+  "dependencies": {
+    "UiPath.Excel.Activities": "[2.22.4]",
+    "UiPath.Mail.Activities": "[1.21.0]",
+    "UiPath.System.Activities": "[23.10.4]",
+    "UiPath.UIAutomation.Activities": "[23.10.9]",
+    "UiPath.Web.Activities": "[1.19.0]"
+  },
+  "runtimeOptions": {
+    "autoDispose": false,
+    "netFrameworkLaunchTarget": "Net6"
+  }
+}
